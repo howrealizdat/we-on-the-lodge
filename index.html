@@ -441,7 +441,7 @@ let state=ST.LOAD, selChar=0, chosenChar=null;
 // "NEW UPDATE" badge appears on the title so returning players know it's fresh —
 // then it clears itself, so they only see it once per update. First-ever players
 // don't see it (nothing to compare to). All wrapped so private-mode can't break it.
-const GAME_VERSION='v3.25';
+const GAME_VERSION='v3.28';
 let _showUpdated=false;
 try{
   const _lv=localStorage.getItem('lodge_ver');
@@ -4387,6 +4387,316 @@ function overlayTick(){
   requestAnimationFrame(overlayTick);
 }
 overlayTick();
+
+// === GAMEPAD / EMULATOR CONTROLLER SUPPORT (June 20, 2026) ====================
+// OPT-IN add-on. Fully dormant unless (a) a controller is connected AND (b) the
+// player turns it on. It NEVER touches keyboard or touch handling — it just reads
+// the pad each frame and fires the SAME synthetic key events the touch buttons use
+// (_synthKey), so the engine/HUD can't tell controller from keyboard. If no pad is
+// plugged in, this whole block does nothing. Mapping + on/off live in localStorage
+// (private-mode safe). Switch: GAMEPAD_FEATURE_ON. Reset: clear lodge_gp_* keys.
+// v3.27: "⚙ SETTINGS" button on the title screen + per-action remap.
+// v3.28: STEERING is ONE control (handles left AND right) — bind it to the D-pad
+//        or a stick once, instead of two separate buttons. Old saved maps migrate.
+const GAMEPAD_FEATURE_ON = true;
+(function(){
+  if(!GAMEPAD_FEATURE_ON) return;
+  if(typeof navigator==='undefined' || !navigator.getGamepads) return;   // no Gamepad API → bail, nothing changes
+  const isTouch = (('ontouchstart' in window) || (navigator.maxTouchPoints||0) > 0);  // phones: leave mobile UI untouched
+
+  // Single-key actions — key/code/kc match exactly what keyboard + touch already send.
+  const KEYS={
+    gas:  {label:'Gas (accelerate)',  key:'ArrowUp',  code:'ArrowUp',  kc:38},
+    brake:{label:'Brake / reverse',   key:'ArrowDown',code:'ArrowDown',kc:40},
+    drift:{label:'Drift (handbrake)', key:'z',        code:'KeyZ',     kc:90},
+    nos:  {label:'NOS boost',         key:'x',        code:'KeyX',     kc:88},
+    start:{label:'Start / confirm',   key:'Enter',    code:'Enter',    kc:13},
+  };
+  // Steering keys (one control fires whichever direction is being pushed).
+  const STEER_L={key:'ArrowLeft', code:'ArrowLeft', kc:37};
+  const STEER_R={key:'ArrowRight',code:'ArrowRight',kc:39};
+
+  // The configurable rows, in setup order. kind 'key' = one button; 'steer' = both ways.
+  const ITEMS=[
+    {id:'gas',   kind:'key',   label:KEYS.gas.label},
+    {id:'brake', kind:'key',   label:KEYS.brake.label},
+    {id:'steer', kind:'steer', label:'Steering (left & right)'},
+    {id:'drift', kind:'key',   label:KEYS.drift.label},
+    {id:'nos',   kind:'key',   label:KEYS.nos.label},
+    {id:'start', kind:'key',   label:KEYS.start.label},
+  ];
+
+  // Sensible default layout for a STANDARD gamepad (used by Reset, and applied the
+  // first time someone turns the controller on with no map yet).
+  const DEFAULT_MAP={
+    gas:{t:'button',i:7}, brake:{t:'button',i:6},   // R2 / L2 triggers
+    steer:{t:'dpad'},                               // D-pad left/right (also honors the left stick)
+    drift:{t:'button',i:0}, nos:{t:'button',i:1},   // A / B
+    start:{t:'button',i:9}                          // Start
+  };
+
+  // ---- persisted state (all wrapped; private mode can't break it) ----
+  function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+  function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+  let gpOn = lsGet('lodge_gp_on')==='1';
+  let gpMap = (function(){ try{ return JSON.parse(lsGet('lodge_gp_map')||'null')||{}; }catch(e){ return {}; } })();
+  // Migrate v3.27 maps (separate left/right) → single steer binding.
+  if(gpMap && gpMap.left && gpMap.right && !gpMap.steer){
+    gpMap.steer = (gpMap.left.t==='axis') ? {t:'axis', i:gpMap.left.i} : {t:'dpad'};
+    delete gpMap.left; delete gpMap.right;
+    try{ lsSet('lodge_gp_map', JSON.stringify(gpMap)); }catch(e){}
+  }
+  function mapComplete(){ return ITEMS.every(it=>gpMap[it.id]); }
+  function saveMap(){ lsSet('lodge_gp_map', JSON.stringify(gpMap)); }
+
+  // ---- read the live pad ----
+  function activePad(){
+    const list = navigator.getGamepads ? navigator.getGamepads() : [];
+    for(const g of list) if(g && g.connected) return g;
+    for(const g of list) if(g) return g;
+    return null;
+  }
+  function padConnected(){ return !!activePad(); }
+  function btn(gp,i){ const b=gp.buttons[i]; return !!b && (b.pressed || b.value>0.5); }
+  function axisVal(gp,i){ const v=gp.axes[i]; return (v==null)?0:v; }
+
+  // Evaluate a single-key binding (button OR axis direction) → pressed true/false.
+  function evalKey(gp, m){
+    if(!gp || !m) return false;
+    if(m.t==='button'){ const b=gp.buttons[m.i]; return !!b && (b.pressed || b.value>0.5); }
+    if(m.t==='axis'){ const v=gp.axes[m.i]; if(v==null) return false; return m.d>0 ? v>0.55 : v<-0.55; }
+    return false;
+  }
+  // Steering: one binding, both directions. dpad = buttons 14/15 (+ left stick); axis = tilt.
+  function steerDir(gp, m, dir){
+    if(!gp || !m) return false;
+    if(m.t==='dpad'){
+      return dir==='left'  ? (btn(gp,14) || axisVal(gp,0) < -0.5)
+                           : (btn(gp,15) || axisVal(gp,0) >  0.5);
+    }
+    if(m.t==='axis'){ const v=axisVal(gp,m.i); return dir==='left' ? v < -0.5 : v > 0.5; }
+    return false;
+  }
+
+  // Friendly name for a binding (assumes the common "standard" layout for labels).
+  const BTN_NAMES={0:'A',1:'B',2:'X',3:'Y',4:'L1',5:'R1',6:'L2',7:'R2',8:'Select',9:'Start',10:'L3',11:'R3',12:'D-pad Up',13:'D-pad Down',14:'D-pad Left',15:'D-pad Right',16:'Home'};
+  function mapDesc(m){
+    if(!m) return 'unset';
+    if(m.t==='dpad') return 'D-pad';
+    if(m.t==='button') return BTN_NAMES[m.i] || ('Button '+m.i);
+    if(m.t==='axis') return 'Stick (axis '+m.i+')';
+    return 'unset';
+  }
+
+  // Show the gear on the title (main) screen — never a race, so race.state is irrelevant.
+  function onTitle(){
+    try{ return typeof state!=='undefined' && typeof ST!=='undefined' && (state===ST.TITLE||state===ST.HOWTO); }catch(e){ return false; }
+  }
+
+  // ---- styles ----
+  const css=document.createElement('style');
+  css.textContent=`
+  #gpGear{position:fixed;left:60px;top:14px;z-index:9000;font-family:monospace;
+    background:rgba(15,15,22,.82);color:#FFB800;border:2px solid #FFB800;border-radius:10px;
+    padding:8px 12px;font-size:13px;font-weight:bold;cursor:pointer;display:none;
+    box-shadow:0 2px 10px rgba(0,0,0,.5);user-select:none;-webkit-user-select:none;}
+  #gpGear.on{color:#33dd55;border-color:#33dd55;}
+  #gpGear:hover{filter:brightness(1.15);}
+  #gpModal,#gpWiz{position:fixed;inset:0;z-index:9001;display:none;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.72);font-family:monospace;color:#fff;padding:20px;}
+  #gpModal .box,#gpWiz .box{background:#12121c;border:2px solid #FFB800;border-radius:16px;
+    max-width:430px;width:100%;max-height:90vh;overflow:auto;padding:22px 20px;
+    box-shadow:0 8px 40px rgba(0,0,0,.7);text-align:center;}
+  #gpModal h2,#gpWiz h2{margin:0 0 6px;font-size:20px;color:#FFB800;letter-spacing:1px;}
+  #gpModal p,#gpWiz p{margin:8px 0;font-size:13px;line-height:1.5;color:#cfcfd6;}
+  .gpbtn{display:block;width:100%;margin:9px 0 0;padding:12px;border-radius:11px;border:2px solid #444;
+    background:#1d1d2a;color:#fff;font-family:monospace;font-size:14px;font-weight:bold;cursor:pointer;}
+  .gpbtn:hover{filter:brightness(1.2);}
+  .gpbtn.green{background:#1d3b25;border-color:#33dd55;color:#7bff9b;}
+  .gpbtn.gold{background:#3a2e08;border-color:#FFB800;color:#FFB800;}
+  .gpbtn.dim{background:#181820;border-color:#3a3a48;color:#9a9aa6;font-size:13px;}
+  .gphdr{margin:16px 0 4px;font-size:11px;letter-spacing:1px;color:#888;text-transform:uppercase;text-align:left;}
+  .gprow{display:flex;align-items:center;gap:8px;margin:5px 0;text-align:left;
+    background:#0d0d14;border:1px solid #23232f;border-radius:8px;padding:7px 9px;}
+  .gprow .glab{flex:1;font-size:12px;color:#dcdce4;}
+  .gprow .gcur{font-size:12px;font-weight:bold;color:#FFB800;min-width:74px;text-align:right;}
+  .gprow .gchg{font-size:11px;font-weight:bold;padding:5px 10px;border-radius:7px;cursor:pointer;
+    border:1px solid #3a3a48;background:#23232f;color:#fff;font-family:monospace;}
+  .gprow .gchg:hover{filter:brightness(1.35);}
+  #gpWiz .cue{font-size:26px;font-weight:bold;color:#fff;margin:16px 0 4px;letter-spacing:1px;}
+  #gpWiz .prog{font-size:12px;color:#888;}
+  #gpWiz .hint{font-size:12px;color:#FFB800;min-height:16px;margin-top:6px;}`;
+  document.head.appendChild(css);
+
+  // ---- DOM: gear button + settings modal + capture overlay ----
+  const gear=document.createElement('button'); gear.id='gpGear'; gear.textContent='⚙ SETTINGS';
+  document.body.appendChild(gear);
+
+  const modal=document.createElement('div'); modal.id='gpModal';
+  modal.innerHTML=`<div class="box">
+    <h2>🎮 CONTROLLER</h2>
+    <p id="gpStatus"></p>
+    <button class="gpbtn green" id="gpToggle"></button>
+    <div class="gphdr">Button mapping — tap “Change”, then press the button you want</div>
+    <div id="gpRows"></div>
+    <button class="gpbtn gold" id="gpFull">RUN FULL SETUP (all buttons)</button>
+    <button class="gpbtn dim" id="gpReset">RESET TO DEFAULT LAYOUT</button>
+    <button class="gpbtn dim" id="gpClose">CLOSE</button>
+  </div>`;
+  document.body.appendChild(modal);
+
+  const wiz=document.createElement('div'); wiz.id='gpWiz';
+  wiz.innerHTML=`<div class="box">
+    <h2 id="gpWizTitle">SET A BUTTON</h2>
+    <p id="gpWizSub">Press the button you want for this action.</p>
+    <div class="prog" id="gpWizProg"></div>
+    <div class="cue" id="gpWizCue"></div>
+    <div class="hint" id="gpWizHint">&nbsp;</div>
+    <button class="gpbtn dim" id="gpWizSkip">SKIP (keep current)</button>
+    <button class="gpbtn dim" id="gpWizCancel">CANCEL</button>
+  </div>`;
+  document.body.appendChild(wiz);
+
+  const $=id=>document.getElementById(id);
+  function itemById(id){ return ITEMS.find(it=>it.id===id); }
+
+  function statusText(){
+    return padConnected()
+      ? (mapComplete() ? 'Controller detected and ready.' : 'Controller detected — turn it on or set up the buttons.')
+      : 'No controller detected — plug it in (USB / wireless dongle) and press any button.';
+  }
+  function refreshModal(){
+    $('gpStatus').textContent = statusText();
+    const tbtn=$('gpToggle');
+    tbtn.textContent = gpOn ? 'CONTROLLER: ON  (tap to turn off)' : 'CONTROLLER: OFF  (tap to turn on)';
+    tbtn.className = 'gpbtn '+(gpOn?'green':'dim');
+    const rows=$('gpRows'); rows.innerHTML='';
+    for(const it of ITEMS){
+      const row=document.createElement('div'); row.className='gprow';
+      const lab=document.createElement('span'); lab.className='glab'; lab.textContent=it.label;
+      const cur=document.createElement('span'); cur.className='gcur'; cur.textContent=mapDesc(gpMap[it.id]);
+      const chg=document.createElement('button'); chg.className='gchg'; chg.textContent='Change';
+      chg.addEventListener('click', ()=>startCapture([it.id]));
+      row.appendChild(lab); row.appendChild(cur); row.appendChild(chg);
+      rows.appendChild(row);
+    }
+  }
+  function openModal(){ refreshModal(); modal.style.display='flex'; }
+  function closeModal(){ modal.style.display='none'; }
+
+  gear.addEventListener('click', openModal);
+  $('gpClose').addEventListener('click', closeModal);
+  $('gpToggle').addEventListener('click', ()=>{
+    if(!gpOn && !mapComplete()){ gpMap=Object.assign({}, DEFAULT_MAP); saveMap(); }  // first time on → sensible defaults
+    gpOn=!gpOn; lsSet('lodge_gp_on', gpOn?'1':'0'); refreshModal(); updateGear();
+  });
+  $('gpFull').addEventListener('click', ()=>startCapture(ITEMS.map(it=>it.id)));
+  $('gpReset').addEventListener('click', ()=>{ gpMap=Object.assign({}, DEFAULT_MAP); saveMap(); refreshModal(); });
+
+  // ---- capture flow (shared by single "Change" and the full walkthrough) ----
+  let capActive=false, capIds=[], capPos=0, capDraft=null, capBaseline=null, capArmed=false, capWaitRelease=null;
+  function snapshot(gp){ return { b:(gp.buttons||[]).map(x=>x?x.value:0), a:(gp.axes||[]).slice() }; }
+  function curItem(){ return itemById(capIds[capPos]); }
+  function startCapture(ids){
+    const gp=activePad();
+    if(!gp){ $('gpStatus').textContent='Plug in a controller and press a button first, then try again.'; openModal(); return; }
+    capIds = (ids && ids.length) ? ids : ITEMS.map(it=>it.id);
+    capDraft = Object.assign({}, gpMap);     // keep all other bindings; only overwrite what we capture
+    capActive=true; capPos=0; capWaitRelease=null;
+    closeModal();
+    $('gpWizTitle').textContent = capIds.length>1 ? 'SET UP CONTROLLER' : 'CHANGE A BUTTON';
+    wiz.style.display='flex'; armStep();
+  }
+  function armStep(){
+    const gp=activePad();
+    capBaseline = gp ? snapshot(gp) : null;
+    capArmed=false;
+    const it=curItem();
+    $('gpWizProg').textContent = capIds.length>1 ? ('Step '+(capPos+1)+' of '+capIds.length) : 'One control';
+    if(it.kind==='steer'){
+      $('gpWizSub').textContent='Press the D-pad left/right, or move a stick — one control steers BOTH ways.';
+      $('gpWizCue').textContent='Set: STEERING';
+    } else {
+      $('gpWizSub').textContent='Press the button you want for this action.';
+      $('gpWizCue').textContent='Press for: '+it.label;
+    }
+    $('gpWizHint').innerHTML='&nbsp;';
+    setTimeout(()=>{ capArmed=true; }, 280);   // settle so a held button from the previous step doesn't bleed in
+  }
+  function recordAndAdvance(entry){
+    capDraft[curItem().id]=entry;
+    $('gpWizHint').textContent='Got it: '+mapDesc(entry);
+    capPos++;
+    if(capPos>=capIds.length) finishCapture();
+    else setTimeout(armStep, 220);
+  }
+  function finishCapture(){
+    gpMap=capDraft; saveMap();
+    if(capIds.length===ITEMS.length){ gpOn=true; lsSet('lodge_gp_on','1'); }  // full setup also switches it on
+    capActive=false; wiz.style.display='none';
+    updateGear(); openModal();
+  }
+  $('gpWizSkip').addEventListener('click', ()=>{ if(!capActive) return; capPos++; if(capPos>=capIds.length) finishCapture(); else armStep(); });
+  $('gpWizCancel').addEventListener('click', ()=>{ capActive=false; wiz.style.display='none'; openModal(); });
+
+  function capPoll(gp){
+    if(!capActive || !capArmed || !gp || !capBaseline) return;
+    if(capWaitRelease){
+      // wait for the captured control to return to neutral before accepting the next
+      const stillL = capWaitRelease.t==='dpad' ? (steerDir(gp,capWaitRelease,'left')||steerDir(gp,capWaitRelease,'right')) : evalKey(gp,capWaitRelease);
+      if(!stillL) capWaitRelease=null;
+      return;
+    }
+    const steerMode = curItem().kind==='steer';
+    // axes first (covers stick + hat d-pads)
+    for(let i=0;i<gp.axes.length;i++){
+      const v=gp.axes[i]; const base=capBaseline.a[i]||0;
+      if(Math.abs(v-base)>0.6){
+        const e = steerMode ? {t:'axis',i} : {t:'axis',i,d:((v-base)>0?1:-1)};
+        capWaitRelease=e; recordAndAdvance(e); return;
+      }
+    }
+    // buttons
+    for(let i=0;i<gp.buttons.length;i++){
+      const v=gp.buttons[i]?gp.buttons[i].value:0; const base=capBaseline.b[i]||0;
+      if(v>0.6 && base<0.4){
+        const e = (steerMode && (i>=12 && i<=15)) ? {t:'dpad'} : {t:'button',i};
+        capWaitRelease=e; recordAndAdvance(e); return;
+      }
+    }
+  }
+
+  // ---- gear visibility (desktop title screen only) ----
+  function updateGear(){
+    const show = (!isTouch) && onTitle();
+    const disp = show ? 'block' : 'none';
+    if(gear.style.display!==disp) gear.style.display=disp;
+    gear.classList.toggle('on', gpOn && padConnected());
+    if(modal.style.display==='flex'){ const st=$('gpStatus'); if(st) st.textContent=statusText(); }
+  }
+  window.addEventListener('gamepadconnected', updateGear);
+  window.addEventListener('gamepaddisconnected', updateGear);
+
+  // ---- main translate loop: pad → synthetic keys (the whole point) ----
+  const prev={};
+  function fire(id, now, key, code, kc){
+    if(now!==!!prev[id]){ _synthKey(now, key, code, kc); prev[id]=now; }   // same path keyboard/touch use
+  }
+  function loop(){
+    const gp=activePad();
+    if(gp){
+      if(capActive){ capPoll(gp); }                       // while remapping, don't drive the car
+      else if(gpOn && mapComplete()){
+        for(const id in KEYS){ const k=KEYS[id]; fire(id, evalKey(gp, gpMap[id]), k.key, k.code, k.kc); }
+        fire('steerL', steerDir(gp, gpMap.steer, 'left'),  STEER_L.key, STEER_L.code, STEER_L.kc);
+        fire('steerR', steerDir(gp, gpMap.steer, 'right'), STEER_R.key, STEER_R.code, STEER_R.kc);
+      }
+    }
+    updateGear();
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
 </script>
 
 </body>
