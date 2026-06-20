@@ -21,6 +21,12 @@ A browser game (HTML5 Canvas + vanilla JavaScript, no framework) with a full thr
 HTML5 Canvas · vanilla JavaScript · Web Audio API · Speech Synthesis API · PWA manifest · Netlify
 AI tooling: DALL·E · Seedance · ElevenLabs
 
+## Pick your driver
+
+Four playable drivers, each with a real car.
+
+![Pick your driver — four drivers, four rides, one Detroit](drivers.png)
+
 ## The box art
 
 ![NES-style box cover](cover.png)
