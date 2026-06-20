@@ -1,0 +1,8 @@
+.DS_Store
+.AppleDouble
+.vscode/
+.idea/
+*.log
+*.tmp
+.env
+.env.*
